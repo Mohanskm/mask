@@ -17,9 +17,9 @@ st.set_page_config(
 # Initialize session state variables if they don't exist
 if 'masked_email' not in st.session_state:
     st.session_state.masked_email = ""
-if 'unmasked_email' not in st.session_state:  # New variable to store unmasked email
+if 'unmasked_email' not in st.session_state:
     st.session_state.unmasked_email = ""
-if 'display_masked' not in st.session_state:  # New variable to track display state
+if 'display_masked' not in st.session_state:
     st.session_state.display_masked = True
 if 'email_id' not in st.session_state:
     st.session_state.email_id = ""
@@ -45,6 +45,52 @@ def get_mapping_filename(email_id):
     """Generate a unique filename for each email's mapping"""
     os.makedirs("mappings", exist_ok=True)
     return f"mappings/entity_mapping_{email_id}.json"
+
+def is_verb_or_pronoun(token):
+    """
+    Check if a token is a verb or pronoun based on its part-of-speech tag
+    
+    Args:
+        token: A spaCy token
+        
+    Returns:
+        Boolean indicating if the token is a verb or pronoun
+    """
+    # POS tags for verbs: 'VERB', 'AUX'
+    # POS tags for pronouns: 'PRON'
+    verb_tags = {'VERB', 'AUX'}
+    pronoun_tags = {'PRON'}
+    
+    return token.pos_ in verb_tags or token.pos_ in pronoun_tags
+
+def should_mask_entity(doc, entity, entity_text):
+    """
+    Determine if an entity should be masked based on linguistic properties
+    
+    Args:
+        doc: The spaCy Doc object
+        entity: The entity span
+        entity_text: The text of the entity
+        
+    Returns:
+        Boolean indicating if the entity should be masked
+    """
+    # If entity text contains any tokens that are verbs or pronouns, don't mask it
+    entity_tokens = [token for token in doc if token.idx >= entity.start_char and token.idx < entity.end_char]
+    
+    # Check if any token in the entity is a verb or pronoun
+    for token in entity_tokens:
+        if is_verb_or_pronoun(token):
+            return False
+    
+    # Check if the entity is a common word (lower case and high frequency)
+    if entity_text.lower() == entity_text and entity_text.lower() in nlp.vocab:
+        # Only skip if it's a common word (high lexical frequency)
+        lexeme = nlp.vocab[entity_text.lower()]
+        if lexeme.is_stop or lexeme.prob < -8:  # -8 is a threshold for common words
+            return False
+    
+    return True
 
 def mask_email(email_text, email_id=None):
     """
@@ -75,6 +121,7 @@ def mask_email(email_text, email_id=None):
     # Track already masked entities to avoid partial replacements
     masked_spans = []
     original_entities = {}
+    skipped_entities = []  # Track entities we decide not to mask
     
     # Create a list of phrases that should be protected from masking
     protected_phrases = set()
@@ -83,10 +130,14 @@ def mask_email(email_text, email_id=None):
     entities_to_mask = []
     for ent in doc.ents:
         if ent.label_ in entity_types:
-            entities_to_mask.append((ent.text, ent.start_char, ent.end_char, ent.label_))
-            if ent.label_ not in original_entities:
-                original_entities[ent.label_] = []
-            original_entities[ent.label_].append(ent.text)
+            # Only add entity if it's not a verb or pronoun
+            if should_mask_entity(doc, ent, ent.text):
+                entities_to_mask.append((ent.text, ent.start_char, ent.end_char, ent.label_))
+                if ent.label_ not in original_entities:
+                    original_entities[ent.label_] = []
+                original_entities[ent.label_].append(ent.text)
+            else:
+                skipped_entities.append((ent.text, ent.label_, "verb_or_pronoun"))
     
     # Add salutation detection for names after "Dear"
     salutation_patterns = [
@@ -109,6 +160,17 @@ def mask_email(email_text, email_id=None):
                 start_char = match.start(1)
                 end_char = match.end(2)
             else:
+                continue
+            
+            # Get the spaCy tokens for this span to check POS
+            span_tokens = [token for token in doc if token.idx >= start_char and token.idx < end_char]
+            
+            # Check if this span contains verbs or pronouns
+            contains_verb_pronoun = any(is_verb_or_pronoun(token) for token in span_tokens)
+            
+            # Skip if contains verb or pronoun
+            if contains_verb_pronoun:
+                skipped_entities.append((name_text, "PERSON", "verb_or_pronoun"))
                 continue
                 
             # Check if this name is already identified by spaCy
@@ -147,6 +209,14 @@ def mask_email(email_text, email_id=None):
                     if part_start != -1:  # If found
                         part_end = part_start + len(part)
                         
+                        # Get tokens for this span
+                        span_tokens = [token for token in doc if token.idx >= part_start and token.idx < part_end]
+                        
+                        # Skip if contains verb or pronoun
+                        if any(is_verb_or_pronoun(token) for token in span_tokens):
+                            skipped_entities.append((part, "PERSON", "verb_or_pronoun"))
+                            continue
+                        
                         # Check if this name is already identified
                         if not any(ent_text == part for ent_text, _, _, _ in entities_to_mask):
                             entities_to_mask.append((part, part_start, part_end, "PERSON"))
@@ -175,9 +245,6 @@ def mask_email(email_text, email_id=None):
         
         # Mark as masked
         masked_spans.append((start_char, end_char))
-    
-    # Mask email addresses, phone numbers, URLs etc. as before...
-    # (rest of the function remains the same)
     
     # Mask email addresses
     email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
@@ -219,7 +286,33 @@ def mask_email(email_text, email_id=None):
             original_entities["URL"] = []
         original_entities["URL"].append(url)
     
-    # Continue with the rest of the function...
+    # NEW: Mask numerical values
+    # Pattern for standalone numbers (integers, decimals, with commas)
+    number_pattern = r'(?<!\w)(?:\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)(?!\w)'
+    
+    # Find all numerical values in the masked email
+    number_matches = list(re.finditer(number_pattern, masked_email))
+    
+    # Mask each numerical value
+    for i, match in enumerate(number_matches):
+        number = match.group()
+        # Skip if this number is part of something already masked (like a phone number)
+        if any(match.start() >= start and match.end() <= end for start, end in masked_spans):
+            continue
+        
+        placeholder = f"[NUMBER_{i + 1}]"
+        entity_map[placeholder] = number
+        # Replace this specific occurrence (not all occurrences to avoid accidental replacements)
+        masked_email = masked_email[:match.start()] + placeholder + masked_email[match.end():]
+        
+        # Add to original entities
+        if "NUMBER" not in original_entities:
+            original_entities["NUMBER"] = []
+        original_entities["NUMBER"].append(number)
+        
+        # Mark as masked
+        masked_spans.append((match.start(), match.end()))
+    
     # Save mapping with unique filename
     mapping_filename = get_mapping_filename(email_id)
     with open(mapping_filename, "w") as f:
@@ -240,7 +333,8 @@ def mask_email(email_text, email_id=None):
         "masked_length": len(masked_email),
         "masking_percentage": f"{masking_percentage:.1f}%",
         "entity_counts": entity_counts,
-        "total_entities_masked": len(entity_map)
+        "total_entities_masked": len(entity_map),
+        "skipped_entities": len(skipped_entities)
     }
     
     return masked_email, email_id, entity_map, masking_stats
@@ -312,7 +406,7 @@ def add_to_history(action, email_id, text_length):
 st.title("🔒 Email Privacy Masking System")
 
 # Create tabs for different functionalities
-tab1, tab2, tab3 = st.tabs(["Mask/Unmask Email", "Entity Mapping", "History"])
+tab1, tab2, tab3, tab4 = st.tabs(["Mask/Unmask Email", "Entity Mapping", "History", "Skipped Entities"])
 
 with tab1:
     col1, col2 = st.columns([3, 1])
@@ -401,11 +495,12 @@ with tab1:
             stats = st.session_state.masking_stats
             
             st.subheader("Masking Statistics")
-            col1, col2, col3, col4 = st.columns(4)
+            col1, col2, col3, col4, col5 = st.columns(5)
             col1.metric("Processing Time", f"{stats['processing_time_seconds']:.3f}s")
             col2.metric("Original Length", stats['original_length'])
             col3.metric("Masked Length", stats['masked_length'])
             col4.metric("Masking Rate", stats['masking_percentage'])
+            col5.metric("Skipped Entities", stats.get('skipped_entities', 0))
             
             # Entity type breakdown
             if 'entity_counts' in stats and stats['entity_counts']:
@@ -464,6 +559,24 @@ with tab3:
     else:
         st.info("No operation history available.")
 
+with tab4:
+    st.subheader("Skipped Entities (Verbs & Pronouns)")
+    
+    # Store skipped entities in session state if not already there
+    if 'skipped_entities' not in st.session_state:
+        st.session_state.skipped_entities = []
+    
+    if st.session_state.skipped_entities:
+        skipped_df = pd.DataFrame(st.session_state.skipped_entities, 
+                                  columns=["Text", "Entity Type", "Reason"])
+        st.dataframe(
+            skipped_df,
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.info("No entities have been skipped yet.")
+
 # Sidebar with information and settings
 with st.sidebar:
     st.title("📋 App Info")
@@ -479,7 +592,12 @@ with st.sidebar:
         - Phone numbers
         - Email addresses
         - URLs
-        - And more!
+        - Numerical values
+        
+        While preserving:
+        - Verbs
+        - Pronouns
+        - Common words
         """
     )
     
@@ -490,8 +608,11 @@ with st.sidebar:
         st.warning("No email currently being processed")
     
     st.subheader("Settings")
-    st.checkbox("Mask Dates", value=True, help="Toggle date masking on/off")
-    st.checkbox("Mask Locations", value=True, help="Toggle location masking on/off")
+    mask_dates = st.checkbox("Mask Dates", value=True, help="Toggle date masking on/off")
+    mask_locations = st.checkbox("Mask Locations", value=True, help="Toggle location masking on/off")
+    mask_numbers = st.checkbox("Mask Numbers", value=True, help="Toggle numerical value masking on/off")
+    ignore_common = st.checkbox("Ignore Common Words", value=True, 
+                              help="Skip masking very common words even if they're detected as entities")
     
     # Footer
     st.markdown("---")
